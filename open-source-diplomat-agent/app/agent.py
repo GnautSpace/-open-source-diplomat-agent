@@ -39,6 +39,8 @@ Node descriptions
 from __future__ import annotations
 
 import json
+import os
+from slack_sdk import WebClient
 from typing import Any
 
 from google.adk.agents import LlmAgent
@@ -47,6 +49,12 @@ from google.adk.events.event import Event
 from google.adk.events.request_input import RequestInput
 from google.adk.workflow import Workflow
 from google.genai import types
+
+from google.adk.tools.mcp_tool import McpToolset
+
+# 2. Extract connection wrappers directly from the underlying protocol engine
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
 
 from app.prompts import (
     ARCHITECTURAL_REVIEWER_INSTRUCTION,
@@ -69,6 +77,36 @@ from app.tools import REVIEWER_TOOLS
 # ---------------------------------------------------------------------------
 
 _MODEL = "gemini-2.5-flash"   # Latest Flash — best latency/cost for workflow nodes
+
+# ---------------------------------------------------------------------------
+# MCP Tools
+# ---------------------------------------------------------------------------
+
+github_tools = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="uvx",
+            args=["github-mcp-server"],
+            env={
+                **os.environ, # Best practice: forward existing PATH/system env vars
+                "GITHUB_PERSONAL_ACCESS_TOKEN": os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+            }
+        )
+    )
+)
+
+slack_tools = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="uvx",
+            args=["slack-mcp-server-v2"],
+            env={
+                **os.environ,
+                "SLACK_USER_TOKEN": os.environ.get("SLACK_USER_TOKEN", "")
+            }
+        )
+    )
+)
 
 # ---------------------------------------------------------------------------
 # LLM Agent Nodes
@@ -99,7 +137,7 @@ architectural_reviewer = LlmAgent(
     name="architectural_reviewer",
     model=_MODEL,
     instruction=ARCHITECTURAL_REVIEWER_INSTRUCTION,
-    tools=REVIEWER_TOOLS,
+    tools=REVIEWER_TOOLS + [github_tools, slack_tools],
     output_schema=ComplianceOutput,
     output_key="compliance",
     description=(
@@ -315,6 +353,13 @@ def finalize_report(ctx: Context, node_input: Any) -> Event:
 
     report_text = _format_final_report(report)
 
+    # ── MCP Integration: Push to Slack channel ──
+    client = WebClient(token=os.environ.get("SLACK_USER_TOKEN"))
+    try:
+        client.chat_postMessage(channel="oss-alerts", text=report_text)
+    except Exception as e:
+        print(f"Slack error: {e}")
+    
     return Event(
         output=report.model_dump(),
         content=types.Content(
@@ -322,7 +367,6 @@ def finalize_report(ctx: Context, node_input: Any) -> Event:
             parts=[types.Part.from_text(text=report_text)],
         ),
     )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -407,6 +451,9 @@ def _format_final_report(report: FinalReport) -> str:
 # ---------------------------------------------------------------------------
 # Workflow Graph Definition
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Workflow Graph Definition
+# ---------------------------------------------------------------------------
 
 root_agent = Workflow(
     name="open_source_diplomat",
@@ -418,29 +465,24 @@ root_agent = Workflow(
     ),
     edges=[
         # ── Ingestion & classification ──────────────────────────────────────
-        # START feeds the raw text into the classifier LLM agent
         ("START", classifier_agent),
-        # classify_input reads the LLM output from state and routes
         (classifier_agent, classify_input),
 
-        # ── Branch: heated disagreement ─────────────────────────────────────
-        (classify_input, moderator_agent, ContentKind.DISAGREEMENT.value),
+        # ── 1. Conditional Routing directly inside the edges list ───────────
+        (classify_input, {
+            ContentKind.DISAGREEMENT.value: moderator_agent,
+            ContentKind.COMPLIANCE.value: architectural_reviewer,
+            ContentKind.UNKNOWN.value: human_triage
+        }),
+
+        # ── 2. Post-processing transitions into HITL triage ────────────────────
         (moderator_agent, prepare_moderation_triage),
-
-        # ── Branch: compliance evaluation ───────────────────────────────────
-        (classify_input, architectural_reviewer, ContentKind.COMPLIANCE.value),
-        (architectural_reviewer, prepare_compliance_triage),
-
-        # ── Unknown content: direct triage pass-through ──────────────────────
-        # For unknown content, classify_input already built the TriagePackage
-        # and stored it in state — skip straight to HITL
-        (classify_input, human_triage, ContentKind.UNKNOWN.value),
-
-        # ── Merge paths into HITL triage node ───────────────────────────────
         (prepare_moderation_triage, human_triage),
+
+        (architectural_reviewer, prepare_compliance_triage),
         (prepare_compliance_triage, human_triage),
 
-        # ── Post-approval: finalize and emit report ──────────────────────────
-        (human_triage, finalize_report),
-    ],
+        # ── 3. Post-approval path ──────────────────────────────────────────────
+        (human_triage, finalize_report), 
+    ]
 )
