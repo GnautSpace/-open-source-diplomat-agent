@@ -1,0 +1,36 @@
+[project]
+name = "open-source-diplomat-agent"
+version = "0.1.0"
+description = "ADK 2.0 graph workflow agent: automated mediator and technical compliance reviewer for open-source repositories."
+requires-python = ">=3.11"
+dependencies = [
+    "google-adk>=2.0.0",
+    "google-genai>=1.0.0",
+    "pydantic>=2.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages=["app"]
